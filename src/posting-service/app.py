@@ -3,25 +3,30 @@ import os
 import uuid
 import boto3
 
+# Inicialização dos clientes fora do handler para reaproveitamento de container (Melhor prática AWS)
 dynamodb = boto3.resource('dynamodb')
 sqs = boto3.client('sqs')
 
-POSTING_TABLE = os.environ.get('PostingTable', 'LedgerPostings')
+# Resgata os nomes gerados dinamicamente pelo CloudFormation
+POSTING_TABLE = os.environ.get('PostingTable')
 QUEUE_URL = os.environ.get('ConsodidationQueueUrl')
 
 def lambda_handler(event, context):
     try:
-        body = json.loads(event.get('body', '{}'))
+        # Tratamento seguro caso o body venha vazio
+        body = json.loads(event.get('body', '{}')) if isinstance(event.get('body'), str) else event.get('body', {})
         
-        # Validação simples de contrato
         merchant_id = body.get('merchant_id')
         amount = body.get('amount')
-        entry_type = body.get('type') # 'CREDIT' ou 'DEBIT'
+        entry_type = body.get('type')  # 'CREDIT' ou 'DEBIT'
+        timestamp = body.get('timestamp')
         
-        if not merchant_id or not amount or entry_type not in ['CREDIT', 'DEBIT']:
+        # Validação estrita de Regra de Negócio
+        if not merchant_id or not amount or entry_type not in ['CREDIT', 'DEBIT'] or not timestamp:
             return {
                 'statusCode': 400,
-                'body': json.dumps({'error': 'Dados de entrada inválidos ou incompletos.'})
+                'headers': {'Content-Type': 'application/json'},
+                'body': json.dumps({'error': 'Dados de entrada inválidos, ausentes ou tipo incorreto.'})
             }
         
         posting_id = str(uuid.uuid4())
@@ -29,29 +34,33 @@ def lambda_handler(event, context):
         item = {
             'merchant_id': merchant_id,
             'posting_id': posting_id,
-            'amount': str(amount),
+            'amount': str(amount), # Armazenado como String/Decimal para evitar mutabilidade de float
             'type': entry_type,
-            'timestamp': body.get('timestamp')
+            'timestamp': timestamp
         }
         
-        # 1. Salva de forma síncrona no domínio de lançamentos
+        # 1. Persistência síncrona no Domínio Core (Posting Table)
         table = dynamodb.Table(POSTING_TABLE)
         table.put_item(Item=item)
         
-        # 2. Despacha evento assíncrono para a fila SQS (Desacoplamento Garantido)
-        if QUEUE_URL:
-            sqs.send_message(
-                QueueUrl=QUEUE_URL,
-                MessageBody=json.dumps(item)
-            )
+        # 2. Desacoplamento Assíncrono via SQS
+        sqs.send_message(
+            QueueUrl=QUEUE_URL,
+            MessageBody=json.dumps(item)
+        )
             
         return {
             'statusCode': 201,
-            'body': json.dumps({'message': 'Lançamento registrado com sucesso!', 'posting_id': posting_id})
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({
+                'message': 'Lançamento registrado com sucesso e enviado para consolidação.', 
+                'posting_id': posting_id
+            })
         }
         
     except Exception as e:
         return {
             'statusCode': 500,
-            'body': json.dumps({'error': str(e)})
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({'error': f'Erro interno no servidor: {str(e)}'})
         }

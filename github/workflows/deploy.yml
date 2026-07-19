@@ -1,0 +1,51 @@
+name: Deploy LedgerFlow - Production
+
+on:
+  push:
+    branches: [ main ] # Gatilho: Push na main branch
+
+jobs:
+  deploy-production:
+    name: Build, Test, and Deploy Stack
+    runs-on: ubuntu-latest
+    
+    permissions:
+      id-token: write # Necessário para autenticação segura OIDC com AWS
+      contents: read
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      # 🧪 1. CAMADA DE TESTES AUTOMATIZADOS (CI)
+      - name: Install Dependencies
+        run: |
+          pip install pytest moto[dynamodb,sqs] boto3
+
+      - name: Run pytest tests
+        run: |
+          pytest tests/ -v # Se falhar aqui, o deploy para
+
+      # 🔐 2. AUTENTICAÇÃO SEGURA NA AWS
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          # Recomendado: Use OIDC em vez de chaves IAM fixas
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActionsDeployRole
+          aws-region: us-east-1
+
+      # 🚀 3. CAMADA DE IMPLANTAÇÃO (CD)
+      - name: Deploy CloudFormation Stack
+        uses: aws-actions/aws-cloudformation-github-deploy@v1
+        with:
+          name: LedgerFlow-Production-Stack
+          template: template-cloudformation.yaml
+          no-fail-on-empty-changeset: "true"
+          capabilities: CAPABILITY_NAMED_IAM
+          parameter-overrides: >
+            Environment=prod

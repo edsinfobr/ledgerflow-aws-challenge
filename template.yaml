@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'LedgerFlow - Producao: Infraestrutura Base via AWS CloudFormation'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Ambiente de implantacao do sistema.
+
+Resources:
+  # =========================================================================
+  # 1. CAMADA DE ARMAZENAMENTO (DYNAMODB)
+  # =========================================================================
+  PostingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'LedgerPostings-${Environment}'
+      AttributeDefinitions:
+        - AttributeName: merchant_id
+          AttributeType: S
+        - AttributeName: posting_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: merchant_id
+          KeyType: HASH
+        - AttributeName: posting_id
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  ConsolidatedTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'LedgerConsolidated-${Environment}'
+      AttributeDefinitions:
+        - AttributeName: merchant_id
+          AttributeType: S
+        - AttributeName: date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: merchant_id
+          KeyType: HASH
+        - AttributeName: date
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # =========================================================================
+  # 2. CAMADA DE MENSAGERIA E RESILIÊNCIA (AMAZON SQS)
+  # =========================================================================
+  ConsolidationQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'consolidation-queue-dlq-${Environment}'
+      MessageRetentionPeriod: 1209600 # 14 dias para analise de falhas
+
+  ConsolidationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'consolidation-queue-${Environment}'
+      VisibilityTimeout: 30
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ConsolidationQueueDLQ.Arn
+        maxReceiveCount: 3
+
+  # =========================================================================
+  # 3. CONTROLE DE ACESSO E PERMISSÕES (AWS IAM)
+  # =========================================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'LedgerFlowLambdaRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: LedgerFlowBusinessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Permissoes do DynamoDB
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:Query'
+                Resource:
+                  - !GetAtt PostingTable.Arn
+                  - !GetAtt ConsolidatedTable.Arn
+              # Permissoes do SQS
+              - Effect: Allow
+                Action:
+                  - 'sqs:SendMessage'
+                  - 'sqs:ReceiveMessage'
+                  - 'sqs:DeleteMessage'
+                  - 'sqs:GetQueueAttributes'
+                Resource: !GetAtt ConsolidationQueue.Arn
+
+  # =========================================================================
+  # 4. CAMADA DE PROVIMENTO COMPUTAÇÃO (AWS LAMBDA NATIVA)
+  # =========================================================================
+  PostingIngestionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'LedgerPostingIngestion-${Environment}'
+      Runtime: python3.11
+      Handler: app.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {"statusCode": 200, "body": "Placeholder para Ingestao"}
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          PostingTable: !Ref PostingTable
+          ConsodidationQueueUrl: !Ref ConsolidationQueue
+
+  ConsolidatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'LedgerConsolidator-${Environment}'
+      Runtime: python3.11
+      Handler: app.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {"statusCode": 200, "body": "Placeholder para Consolidacao"}
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ConsolidatedTable: !Ref ConsolidatedTable
+
+  # MAPEAMENTO DE EVENTO: SQS -> Lambda Consolidator
+  SQSEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt ConsolidationQueue.Arn
+      FunctionName: !Ref ConsolidatorFunction
+
+  # =========================================================================
+  # 5. EXPOSIÇÃO DA API (AMAZON API GATEWAY NATIVO)
+  # =========================================================================
+  PostingApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'LedgerFlowAPI-${Environment}'
+      Description: API Gateway para gerenciamento de fluxo de caixa.
+
+  PostingApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PostingApi
+      ParentId: !GetAtt PostingApi.RootResourceId
+      PathPart: postings
+
+  PostingApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PostingApi
+      ResourceId: !Ref PostingApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: '201'
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PostingIngestionFunction.Arn}/invocations'
+
+  PostingApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: PostingApiMethod
+    Properties:
+      RestApiId: !Ref PostingApi
+
+  PostingApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref PostingApi
+      DeploymentId: !Ref PostingApiDeployment
+      StageName: !Ref Environment
+
+  # Permissao explicita para o API Gateway invocar a Lambda
+  PostingApiLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref PostingIngestionFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:apigateway:${AWS::Region}:${AWS::AccountId}:${PostingApi}/*/*/postings'
+
+Outputs:
+  ApiUrl:
+    Description: 'URL de entrada para o registro de lancamentos'
+    Value: !Sub 'https://${PostingApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/postings'

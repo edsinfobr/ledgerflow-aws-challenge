@@ -1,0 +1,59 @@
+### Componentes e Escolhas Tecnológicas (Justificativas)
+
+*   **Amazon API Gateway:** Camada de entrada gerenciada. Fornece throttling nativo, autenticação e baixa latência de ponta a ponta.
+*   **AWS Lambda:** Execução *serverless* com escalabilidade horizontal automática. Elimina o custo de servidores ociosos e escala instantaneamente durante picos de tráfego.
+*   **Amazon SQS (Simple Queue Service):** O coração do desacoplamento. Se o serviço de consolidação falhar ou ficar lento, as mensagens ficam retidas na fila por até 14 dias. **Resultado:** Disponibilidade total para o serviço de lançamentos e perda zero de dados.
+*   **Amazon DynamoDB:** Banco de dados NoSQL chave-valor com latência na casa de um dígito de milisegundo. Utiliza estratégias de *Single-Table Design* para máxima eficiência.
+
+---
+
+## 🔄 4. Arquitetura de Transição (Migração de Legado)
+
+Caso a empresa possua um sistema legatário monolítico (On-Premises ou EC2 com banco relacional compartilhado), a transição será feita utilizando o padrão **Strangler Fig (Padrão Estrangulador)** assistido por **Change Data Capture (CDC)**:
+
+1.  **Fase 1 (Coexistência):** Instalação de uma ferramenta de CDC (como o AWS DMS ou Debezium) apontada para o banco de dados do legado. Cada inserção de lançamento no legado gera um evento enviado para o nosso **Amazon SQS**.
+2.  **Fase 2 (Estrangulamento da Escrita):** O tráfego de gravação da API de lançamentos é redirecionado para o novo *API Gateway + Lambda*. O novo Lambda passa a salvar no DynamoDB e postar no SQS. Um processo espelho pode devolver os dados temporariamente ao legado se houver necessidade de *rollback*.
+3.  **Fase 3 (Desativação):** Assim que os relatórios de consolidação passarem a ler 100% da nova estrutura e a resiliência for homologada, o monolito legado é desligado.
+
+---
+
+## 🔒 5. Segurança e Observabilidade
+
+### Segurança (Well-Architected - Security Pillar)
+*   **Autenticação/Autorização:** Integração do API Gateway com o **Amazon Cognito** ou validação de tokens JWT (OAuth2).
+*   **Princípio do Menor Privilégio:** As funções IAM das Lambdas possuem permissões estritas de escrita/leitura apenas nos recursos específicos necessários.
+*   **Criptografia:** Todos os dados armazenados no DynamoDB e em trânsito (HTTPS/TLS) utilizam criptografia gerenciada por chaves do AWS KMS.
+
+### Monitoramento (Well-Architected - Operational Excellence)
+*   **AWS CloudWatch Metrics & Logs:** Rastreamento de métricas críticas como `ConcurrentExecutions` das Lambdas, `ApproximateAgeOfOldestMessage` na fila SQS (para monitorar gargalos de consolidação) e erros 5XX no API Gateway.
+*   **AWS X-Ray:** Rastreamento distribuído (*Distributed Tracing*) ponta a ponta para identificar latências e gargalos entre as chamadas do API Gateway, SQS e DynamoDB.
+
+---
+
+## 💰 6. Estimativa de Custos (AWS Pricing Calculator)
+
+Considerando o cenário de pico extrapolado para o mês inteiro (média de 50 RPS constantes = ~130 milhões de requisições/mês):
+
+| Serviço AWS | Configuração Estimada | Custo Mensal Aproximado |
+| :--- | :--- | :--- |
+| **Amazon API Gateway** | 130M requisições REST | ~$45.00 |
+| **AWS Lambda** | 130M execuções (128MB, média de 100ms) | ~$27.00 |
+| **Amazon SQS** | 130M requisições de fila (padrão) | ~$52.00 |
+| **Amazon DynamoDB** | Sob demanda (Pay-per-request) | ~$35.00 |
+| **CloudWatch + X-Ray** | Coleta de logs e traços básicos | ~$15.00 |
+| **Total Estimado** | | **~$174.00 / mês** |
+
+---
+
+## 🚀 7. Como Executar o Projeto Localmente
+
+### Pré-requisitos
+*   Docker instalado
+*   AWS SAM CLI instalado
+*   Python 3.11+ instalado
+
+### Passos para Execução
+1. Clone o repositório:
+   ```bash
+   git clone [https://github.com/seu-usuario/ledgerflow.git](https://github.com/seu-usuario/ledgerflow.git)
+   cd ledgerflow
